@@ -146,6 +146,45 @@ public class LookupTest {
   }
 
   @Test
+  void testRun_firstSearchPathHitsServFail() throws Exception {
+    wireUpMockResolver(mockResolver, this::firstSERVFAILThenA);
+
+    Lookup lookup = makeLookupWithResolver(mockResolver, "host2");
+    lookup.setSearchPath("first.example.com", "second.example.com");
+    Record[] results = lookup.run();
+
+    ArgumentCaptor<Message> messageCaptor = ArgumentCaptor.forClass(Message.class);
+    verify(mockResolver, times(2)).send(messageCaptor.capture());
+
+    List<Message> queries = messageCaptor.getAllValues();
+
+    assertEquals(
+        Record.newRecord(
+            Name.fromConstantString("host2.first.example.com."), Type.A, DClass.IN, 0L),
+        queries.get(0).getQuestion());
+    assertEquals(
+        Record.newRecord(
+            Name.fromConstantString("host2.second.example.com."), Type.A, DClass.IN, 0L),
+        queries.get(1).getQuestion());
+
+    assertEquals(1, results.length);
+    assertEquals(lookup.getResult(), Lookup.SUCCESSFUL);
+  }
+
+  Message firstSERVFAILThenA(Message query) {
+    Message answer = new Message(query.getHeader().getID());
+    answer.addRecord(query.getQuestion(), Section.QUESTION);
+    Name questionName = query.getQuestion().getName();
+    if (questionName.equals(Name.fromConstantString("host2.first.example.com."))) {
+      answer.getHeader().setRcode(Rcode.SERVFAIL);
+    } else {
+      Record r = new ARecord(questionName, DClass.IN, 0, InetAddress.getLoopbackAddress());
+      answer.addRecord(r, Section.ANSWER);
+    }
+    return answer;
+  }
+
+  @Test
   void testRun_CNAMELoop() throws Exception {
     wireUpMockResolver(mockResolver, this::cnameLoopAnswer);
 

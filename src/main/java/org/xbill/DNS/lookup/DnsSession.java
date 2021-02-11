@@ -2,10 +2,15 @@
 package org.xbill.DNS.lookup;
 
 import static java.lang.String.format;
+import static java.util.Collections.emptyList;
+import static java.util.stream.Collectors.toList;
 
+import java.util.Iterator;
 import java.util.List;
+import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
+import java.util.stream.Stream;
 import org.xbill.DNS.CNAMERecord;
 import org.xbill.DNS.DClass;
 import org.xbill.DNS.DNAMERecord;
@@ -27,13 +32,14 @@ public class DnsSession {
 
   private final Resolver resolver;
   private volatile int maxRedirects = DEFAULT_MAX_ITERATIONS;
+  private volatile List<Name> searchPath = emptyList();
 
   /**
    * Construct a DNSSession using the provided Resolver to lookup records.
    *
    * @param resolver the {@link Resolver} instance to backing this DNSSession.
    */
-  DnsSession(Resolver resolver) {
+  public DnsSession(Resolver resolver) {
     this.resolver = resolver;
   }
 
@@ -47,6 +53,20 @@ public class DnsSession {
     this.maxRedirects = maxRedirects;
   }
 
+  public void setSearchPath(List<Name> searchPath) {
+    this.searchPath =
+        searchPath.stream()
+            .map(
+                name -> {
+                  try {
+                    return Name.concatenate(name, Name.root);
+                  } catch (NameTooLongException e) {
+                    throw new IllegalArgumentException("Search path name too long");
+                  }
+                })
+            .collect(toList());
+  }
+
   /**
    * Make an asynchronous lookup of the provided name.
    *
@@ -56,10 +76,51 @@ public class DnsSession {
    * @return A {@link CompletionStage} what will yield the eventual lookup result.
    */
   public CompletionStage<LookupResult> lookupAsync(Name name, int type, int dclass) {
-    Record question = Record.newRecord(name, type, dclass);
-    Message query = Message.newQuery(question);
+    CompletableFuture<LookupResult> future = new CompletableFuture<>();
+    lookupUntilSuccess(expandName(name).iterator(), type, dclass, future);
+    return future;
+  }
 
-    return resolver.sendAsync(query).thenCompose(this::resolveRedirects);
+  /**
+   * Generate a stream of names according to the search path application semantics. The semantics of
+   * this is a bit odd, but they are inherited from Lookup.java. Note that the stream returned is
+   * never empty, as it will at the very least always contain name.
+   */
+  Stream<Name> expandName(Name name) {
+    if (name.isAbsolute()) {
+      return Stream.of(name);
+    }
+    return Stream.concat(
+        searchPath.stream()
+            .map(searchSuffix -> safeConcat(name, searchSuffix))
+            .filter(Objects::nonNull),
+        Stream.of(safeConcat(name, Name.root)));
+  }
+
+  private static Name safeConcat(Name name, Name suffix) {
+    try {
+      return Name.concatenate(name, suffix);
+    } catch (NameTooLongException e) {
+      return null;
+    }
+  }
+
+  private void lookupUntilSuccess(
+      Iterator<Name> names, int type, int dclass, CompletableFuture<LookupResult> future) {
+    // TODO: how are exceptional failures handled before the end of the search order?
+    resolver
+        .sendAsync(Message.newQuery(Record.newRecord(names.next(), type, dclass)))
+        .thenCompose(this::resolveRedirects)
+        .whenComplete(
+            (result, ex) -> {
+              if (ex != null) {
+                future.completeExceptionally(ex);
+              } else if (!result.get().isEmpty() || !names.hasNext()) {
+                future.complete(result);
+              } else {
+                lookupUntilSuccess(names, type, dclass, future);
+              }
+            });
   }
 
   private CompletionStage<LookupResult> resolveRedirects(Message response) {

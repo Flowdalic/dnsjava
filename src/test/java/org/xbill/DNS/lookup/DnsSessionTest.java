@@ -1,8 +1,10 @@
 package org.xbill.DNS.lookup;
 
 import static java.lang.String.format;
+import static java.util.Arrays.asList;
 import static java.util.Collections.emptyList;
 import static java.util.Collections.singletonList;
+import static java.util.stream.Collectors.toList;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.ArgumentMatchers.any;
@@ -21,14 +23,19 @@ import static org.xbill.DNS.lookup.AdditionalDetail.NXDOMAIN;
 import static org.xbill.DNS.lookup.AdditionalDetail.NXRRSET;
 
 import java.net.InetAddress;
+import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ExecutionException;
 import java.util.function.Function;
+import java.util.stream.Collectors;
+import java.util.stream.IntStream;
+import java.util.stream.Stream;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.junit.jupiter.api.function.Executable;
+import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.xbill.DNS.*;
@@ -187,6 +194,105 @@ class DnsSessionTest {
     answer.addRecord(
         new CNAMERecord(question.getName(), CNAME, IN, name("target2.")), Section.ANSWER);
     return answer;
+  }
+
+  @Test
+  void lookupAsync_searchAppended() throws Exception {
+    wireUpMockResolver(mockResolver, query -> answer(query, name -> LOOPBACK_A));
+
+    DnsSession dnsSession = new DnsSession(mockResolver);
+
+    dnsSession.setSearchPath(singletonList(name("example.com")));
+    CompletionStage<LookupResult> resultFuture = dnsSession.lookupAsync(name("host"), A, IN);
+    LookupResult lookupResult = resultFuture.toCompletableFuture().get();
+
+    ArgumentCaptor<Message> messageCaptor = ArgumentCaptor.forClass(Message.class);
+    verify(mockResolver).sendAsync(messageCaptor.capture());
+
+    assertEquals(
+        Record.newRecord(Name.fromConstantString("host.example.com."), Type.A, DClass.IN, 0L),
+        messageCaptor.getValue().getSection(Section.QUESTION).get(0));
+
+    assertEquals(singletonList(LOOPBACK_A.withName(name("host.example.com."))), lookupResult.get());
+  }
+
+  @Test
+  void lookupAsync_searchAppendTooLongName() throws Exception {
+    wireUpMockResolver(mockResolver, query -> answer(query, name -> LOOPBACK_A));
+
+    DnsSession dnsSession = new DnsSession(mockResolver);
+
+    dnsSession.setSearchPath(
+        singletonList(name(format("%s.%s.%s", LONG_LABEL, LONG_LABEL, LONG_LABEL))));
+    CompletionStage<LookupResult> resultFuture = dnsSession.lookupAsync(name(LONG_LABEL), A, IN);
+    LookupResult lookupResult = resultFuture.toCompletableFuture().get();
+
+    ArgumentCaptor<Message> messageCaptor = ArgumentCaptor.forClass(Message.class);
+    verify(mockResolver).sendAsync(messageCaptor.capture());
+
+    assertEquals(
+        Record.newRecord(name(LONG_LABEL + "."), A, IN, 0L),
+        messageCaptor.getValue().getSection(Section.QUESTION).get(0));
+
+    assertEquals(singletonList(LOOPBACK_A.withName(name(LONG_LABEL + "."))), lookupResult.get());
+  }
+
+  @Test
+  void lookupAsync_twoItemSearchPath() throws Exception {
+    wireUpMockResolver(
+        mockResolver,
+        query -> answer(query, name -> name.equals(name("host.a.")) ? null : LOOPBACK_A));
+
+    DnsSession dnsSession = new DnsSession(mockResolver);
+
+    dnsSession.setSearchPath(asList(name("a"), name("b")));
+    CompletionStage<LookupResult> resultFuture = dnsSession.lookupAsync(name("host"), A, IN);
+    LookupResult lookupResult = resultFuture.toCompletableFuture().get();
+
+    ArgumentCaptor<Message> messageCaptor = ArgumentCaptor.forClass(Message.class);
+    verify(mockResolver, times(2)).sendAsync(messageCaptor.capture());
+
+    List<Message> allValues = messageCaptor.getAllValues();
+    assertEquals(
+        Record.newRecord(Name.fromConstantString("host.a."), Type.A, DClass.IN, 0L),
+        allValues.get(0).getSection(Section.QUESTION).get(0));
+    assertEquals(
+        Record.newRecord(Name.fromConstantString("host.b."), Type.A, DClass.IN, 0L),
+        allValues.get(1).getSection(Section.QUESTION).get(0));
+
+    assertEquals(singletonList(LOOPBACK_A.withName(name("host.b."))), lookupResult.get());
+  }
+
+  @Test
+  public void setSearchPath_tooLongRelativeName() {
+    DnsSession session = new DnsSession(mockResolver);
+    String label = IntStream.range(0, 62).mapToObj(i -> "a").collect(Collectors.joining());
+    Name longRelativeLabel = name(format("%s.%s.%s.%s", LONG_LABEL, LONG_LABEL, LONG_LABEL, label));
+    assertThrows(
+        RuntimeException.class, () -> session.setSearchPath(singletonList(longRelativeLabel)));
+  }
+
+  @Test
+  public void expandName_absolute() {
+    DnsSession session = new DnsSession(mockResolver);
+    Stream<Name> nameStream = session.expandName(name("a."));
+    assertEquals(singletonList(name("a.")), nameStream.collect(toList()));
+  }
+
+  @Test
+  public void expandName_singleSearchPath() {
+    DnsSession session = new DnsSession(mockResolver);
+    session.setSearchPath(singletonList(name("example.com.")));
+    Stream<Name> nameStream = session.expandName(name("host"));
+    assertEquals(asList(name("host.example.com."), name("host.")), nameStream.collect(toList()));
+  }
+
+  @Test
+  public void expandName_searchPathIsMadeAbsolute() {
+    DnsSession session = new DnsSession(mockResolver);
+    session.setSearchPath(singletonList(name("example.com")));
+    Stream<Name> nameStream = session.expandName(name("host"));
+    assertEquals(asList(name("host.example.com."), name("host.")), nameStream.collect(toList()));
   }
 
   private static final ARecord LOOPBACK_A =
